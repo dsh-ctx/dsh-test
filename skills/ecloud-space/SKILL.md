@@ -1,6 +1,6 @@
 ---
 name: ecloud-space
-description: Access 中国移动「移动云空间」(Ecpan, www.ecpan.cn) on Windows without driving the Windows UI. Use for personal and group cloud disks: account/quota, list, create folders, upload/download small files, WPS view/edit links, and IM organization lookup. Chat itself stays in the desktop client.
+description: Access 中国移动「移动云空间」(Ecpan, www.ecpan.cn) on Windows without Windows mouse/keyboard input. Use for personal and group cloud disks (list, folders, small-file upload/download, WPS view/edit links, IM organizations), and for sending one chat message through the client's web IM page on a local debug port.
 ---
 
 # 移动云空间 (Ecpan) access
@@ -69,38 +69,53 @@ pwsh -File scripts\ecloud.ps1 view-url -Group "temp-waicai" -Path "some-folder\a
 
 # Read-only IM organization lookup and local client description.
 pwsh -File scripts\ecloud.ps1 im-orgs -Json
-pwsh -File scripts\ecloud.ps1 client-info
+pwsh -File scripts\ecloud.ps1 client-debug-status
+
+# Code-based chat send through the client's web IM page (explicit request only).
+pwsh -File scripts\ecloud.ps1 msg-send -To "文件传输助手" -Text "test message" -DryRun
+pwsh -File scripts\ecloud.ps1 msg-send -To "文件传输助手" -Text "test message" -Yes
 ```
 
 ## Safety rules
 
-1. Default to read-only operations (`status`, `whoami`, `ls`, `groups`, `group-ls`, `im-orgs`, `client-info`).
-2. `mkdir`, `group-mkdir`, `upload` and `download` run only when the user explicitly asks for that operation, and
-   require `-Yes`. Use a clear test name; do not touch groups or folders the user did not name.
+1. Default to read-only operations (`status`, `whoami`, `ls`, `groups`, `group-ls`, `im-orgs`, `client-info`,
+   `client-debug-status`).
+2. `mkdir`, `group-mkdir`, `upload`, `download` and `msg-send` run only when the user explicitly asks for that
+   operation, and require `-Yes`. Use a clear test name; do not touch groups, folders or chats the user did not name.
 3. `upload` is limited to files up to 5 MB because the chunked browser uploader is not reimplemented. Do not upload
    into a production group without an explicit instruction.
 4. `view-url` returns a WPS URL containing a short-lived token. Give it to the user; do not paste it into tickets or
    logs. Opening it is a normal browser action, not Windows UI automation.
-5. Never use the session for another person's disk or another organization. The session belongs to the account that
+5. `msg-send` defaults to the **文件传输助手** chat. Sending to any other chat also needs `-AllowAnyChat` and an
+   explicit user instruction naming that chat. The helper requires an exact chat-name match, verifies the opened
+   conversation, sends one message, and never sends in bulk. Use `-DryRun` first when unsure.
+6. Never use the session for another person's disk or another organization. The session belongs to the account that
    logged in.
-6. If a response is `SESSION_TIMEOUT`, ask the user to log in again; do not try to guess credentials.
+7. If a response is `SESSION_TIMEOUT`, ask the user to log in again; do not try to guess credentials.
 
-## Messaging (desktop client only)
+## Messaging (code-based, opt-in client debug port)
 
-The web app exposes read-only IM queries (`/access/IMLogin/getValidOrgIds`,
-`/access/Contacts/getOrgsName`) but **no public send/list-history API**. The native client's chat uses the AACE TCP
-protocol (`Aace::tcp_client`, `MsgSender`) and SQLCipher databases under
-`%APPDATA%\suyan\yunpan\data\<im-user-id>\`. The web-session POST to `/access/SingleChat/sendMsg` returns
-`retcode=-90006` with `msgId=0`, so it does not deliver a message.
+The native client's IM uses the AACE TCP protocol and SQLCipher databases, so there is **no pure HTTP send API**.
+However, the client embeds a **web IM page** (`.../pc-local/pc-main/0.0.1/index.html?...&orgname=...#/im`) that talks
+to the native bridge (`s.call("chat","sendMessage", ...)`). With the client started with a local CEF debug port, this
+skill drives that page with CDP and DOM/JS: it opens the named chat, inserts text into the editor, and dispatches
+Enter. It does **not** synthesize Windows mouse or keyboard input.
 
-This skill deliberately does not automate the Windows client UI. What the agent can do for messages:
+Prerequisite (one-time per client launch):
 
-- Report that messaging is client-only, and show the client path and account from `client-info`.
-- Ask the user to use the client's **消息** view (the client keeps its login state).
-- Do not synthesize clicks or keystrokes, do not scrape process memory, and do not attempt to decrypt `welldone.db`.
+```powershell
+# Close the 移动云空间 client, then relaunch it with:
+& 'C:\ProgramData\Ecloud\Ecpan\Ecloud Cloud Ecpan Application.exe' --remote-debugging-port=9222 --remote-allow-origins=*
+# Log in (or use the client's auto-login). Then:
+pwsh -File scripts\ecloud.ps1 client-debug-status   # available + imPage true
+```
 
-If the user explicitly accepts Windows UI automation for messaging, that is a separate, opt-in helper and must be
-reviewed as such; it is not part of this skill.
+`msg-send` flow: `client-debug-status` → `msg-send -To "文件传输助手" -Text "..." -DryRun` → `-Yes`.
+The debug port is local-only but powerful: any local process can control the client's web pages. Restart the client
+normally after the messaging task to remove it. Chat history remains in the client UI; this skill only sends.
+
+Verified on 2026-11-07: two messages were sent to 文件传输助手 from the web IM page with no Windows mouse/keyboard
+input (`dsh-superagent 代码发送测试，请忽略`, `dsh-superagent 技能发送测试，请忽略`).
 
 ## Environment facts (verified on 2026-11-07)
 
@@ -115,7 +130,8 @@ reviewed as such; it is not part of this skill.
 | Personal disk | diskType `1`; root folder name `个人盘`; root lookup `parentId=-1` |
 | Group space | diskType `2`; list by `group:groupList`; root `parentId = groupId` |
 | Test group | `temp-waicai` (groupId `516940`, created for verification; one member) |
-| Test artifacts | `个人盘\dsh-ecloud-skill-test-*`; `temp-waicai\dsh-ecloud-skill-test` with two small `.txt` files and one empty sub-folder |
+| Debug port | `9222` (local CEF; only while the client is launched with `--remote-debugging-port=9222`) |
+| Test artifacts | `个人盘\dsh-ecloud-skill-test-*`; `temp-waicai\dsh-ecloud-skill-test` with two small `.txt` files and one empty sub-folder; two chat test messages in 文件传输助手 |
 
 The account-specific values above are examples from the verification machine; read the current values from
 `whoami` instead of hard-coding them.

@@ -20,7 +20,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('login', 'status', 'whoami', 'ls', 'mkdir', 'groups', 'group-ls', 'group-mkdir', 'upload', 'download', 'view-url', 'im-orgs', 'client-info')]
+    [ValidateSet('login', 'status', 'whoami', 'ls', 'mkdir', 'groups', 'group-ls', 'group-mkdir', 'upload', 'download', 'view-url', 'msg-send', 'client-debug-status', 'im-orgs', 'client-info')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -31,10 +31,14 @@ param(
     [string]$File,
     [string]$Out,
     [string]$RemoteName,
+    [string]$To = '文件传输助手',
+    [string]$Text,
     [string]$Cookie,
     [string]$BaseUrl = 'https://www.ecpan.cn',
     [switch]$Yes,
     [switch]$Edit,
+    [switch]$DryRun,
+    [switch]$AllowAnyChat,
     [switch]$Json
 )
 
@@ -267,6 +271,25 @@ function Get-GroupDownloadUrl($GroupInfo, $FileInfo) {
     $url = $r.var.downloadUrl
     if (-not $url) { throw 'Download URL missing from response.' }
     return $url
+}
+
+function Get-CefImStatus {
+    $result = [pscustomobject]@{
+        available = $false; pages = 0; imPage = $false; url = $null; error = $null
+    }
+    try {
+        $raw = Invoke-WebRequest -Uri 'http://127.0.0.1:9222/json/list' -UseBasicParsing -TimeoutSec 3
+        $parsed = $raw.Content | ConvertFrom-Json
+        $list = @($parsed)
+        $im = $list | Where-Object { $_.type -eq 'page' -and ([string]$_.url) -like '*#/im*' } | Select-Object -First 1
+        $result.available = $true
+        $result.pages = $list.Count
+        $result.imPage = [bool]$im
+        if ($im) { $result.url = [string]$im.url }
+    } catch {
+        $result.error = $_.Exception.Message
+    }
+    return $result
 }
 
 function Format-Size([long]$Bytes) {
@@ -588,6 +611,47 @@ try {
                 Write-Output "WPS $([bool]$Edit ? 'edit' : 'view') URL for '$($f.fileName)': $url"
             }
         }
+        'msg-send' {
+            if (-not $Text) { throw 'msg-send requires -Text <message>.' }
+            if (-not $DryRun) { Assert-Confirmed "send a message" }
+            $helper = Join-Path $PSScriptRoot 'im-send.mjs'
+            if (-not (Test-Path -LiteralPath $helper)) { throw "IM send helper not found: $helper" }
+            if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js is required for msg-send.' }
+            $nodeArgs = @($helper, '--to', $To, '--text', $Text)
+            if ($AllowAnyChat) { $nodeArgs += '--allow-any-chat' }
+            if ($DryRun) { $nodeArgs += '--dry-run' }
+            $output = & node @nodeArgs 2>&1
+            $code = $LASTEXITCODE
+            $raw = ($output | Out-String).Trim()
+            if ($Json) {
+                Write-Output $raw
+            } else {
+                try {
+                    $o = $raw | ConvertFrom-Json
+                    if ($o.ok) {
+                        if ($o.dryRun) { Write-Output "Dry run OK: '$($o.chat)' is open and the editor accepts text." }
+                        else { Write-Output "Sent to '$($o.chat)': $Text" }
+                    } else {
+                        Write-Output "Not sent: $($o.reason) $($o.hint)"
+                    }
+                } catch {
+                    Write-Output $raw
+                }
+            }
+            if ($code -ne 0) { throw "msg-send failed (exit $code): $raw" }
+        }
+        'client-debug-status' {
+            $st = Get-CefImStatus
+            if ($Json) {
+                $st | ConvertTo-Json -Depth 3
+            } else {
+                Write-Output "CEF debug port 9222 available: $($st.available)"
+                Write-Output "IM page ready: $($st.imPage)  (pages: $($st.pages))"
+                if (-not $st.imPage) {
+                    Write-Output 'Start the desktop client with --remote-debugging-port=9222 --remote-allow-origins=* and log in.'
+                }
+            }
+        }
         'im-orgs' {
             $s = Get-Session
             if (-not ($s.timeStamp -and $s.token)) { throw 'Session has no IM cookies (timeStamp/token). Re-run login.' }
@@ -630,6 +694,7 @@ try {
             $data = Join-Path $env:APPDATA 'suyan\yunpan'
             $proc = Get-Process -Name 'Ecloud Cloud Ecpan Application' -ErrorAction SilentlyContinue |
                 Sort-Object StartTime | Select-Object -First 1
+            $cef = Get-CefImStatus
             $info = [pscustomobject]@{
                 installed = (Test-Path -LiteralPath $exe)
                 executable = $exe
@@ -642,7 +707,10 @@ try {
                         Select-Object -First 1 -ExpandProperty FullName
                 } else { $null }
                 sessionSaved = (Test-Path -LiteralPath $script:SessionPath)
-                messaging = 'Desktop-client native IM only; no public HTTP send/list API.'
+                cefDebugPort = 9222
+                cefDebugAvailable = $cef.available
+                imPageAvailable = $cef.imPage
+                messaging = 'Code-based send via the client web IM page when the CEF debug port is enabled; otherwise the native client.'
             }
             if ($Json) { $info | ConvertTo-Json -Depth 4 } else { $info | Format-List | Out-String -Width 240 | Write-Output }
         }

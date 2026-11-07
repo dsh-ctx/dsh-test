@@ -178,7 +178,44 @@ credential and give it only to the user who asked for the file.
 | Search | `disk:searchIndex` | Not needed for the verification |
 | Chunked upload (`>5 MB`) | `common:upload` + `common:completeUpload` | Requires the browser worker's chunk protocol |
 
-## IM (read-only)
+## Web IM page and code-based send
+
+The client exposes a web IM page in its CEF:
+
+```
+https://www.ecpan.cn/pc-local/pc-main/0.0.1/index.html?orgid=<orgId>&orgname=<orgName>#/im
+```
+
+Start the client with a local debug port to inspect it:
+
+```
+Ecloud Cloud Ecpan Application.exe --remote-debugging-port=9222 --remote-allow-origins=*
+```
+
+`GET http://127.0.0.1:9222/json/list` then contains the `#/im` page (plus drive, contacts, workbench,
+meeting, notification pages). The page is React 16 + Redux and calls the native bridge for chat; it is not a pure
+HTTP client. Sending through the page is code-driven: CDP `Runtime.evaluate` clicks the chat item,
+inserts text into the contenteditable editor, and dispatches an Enter `keydown`. The editor's React `onKeyDown`
+handler calls `onSendMsg`, which calls the native bridge (`s.call("chat","sendMessage", ...)`) and clears the draft.
+
+Useful DOM facts:
+
+| Item | Selector / value |
+|---|---|
+| 文件传输助手 chat item | `#u19999` (class gains `active-...` when selected) |
+| Chat name in the list | `.ellipsis.c-dark` inside an item whose id matches `^[ug]\d+$` |
+| Conversation header | element at `y < 60`, `x > 280` whose text equals the chat name |
+| Message editor | visible `[contenteditable=true]` with `0 < height < 120` |
+| Send trigger | `keydown` Enter on the editor (button `disabled` may stay true because the app model is not updated by `execCommand`) |
+
+`scripts/im-send.mjs` implements this, defaults to 文件传输助手, requires an exact chat name and an explicit
+`--allow-any-chat` for anything else, supports `--dry-run`, and verifies that the draft clears and the text appears
+in the page. It does not send in bulk and does not read history. The debug port is local-only but powerful; close it
+by restarting the client normally after use.
+
+Verified on 2026-11-07: two test messages were sent to 文件传输助手 with this path, no Windows mouse/keyboard input.
+
+## IM (read-only HTTP)
 
 Base: `https://www.ecpan.cn`, same cookies.
 
@@ -193,14 +230,13 @@ POST /access/Contacts/getOrgsName
 Successful responses are `{"retcode":0,"errmsg":"处理成功","data":...}`. `retcode=-90006` means the IM token is
 missing or expired; `retcode=100` with empty `validOrgIds` means the account has no other IM organization.
 
-The chat itself is **not** available here. The native client uses
-`C:\ProgramData\Ecloud\Ecpan\Ecloud Cloud Ecpan Application.exe` with the AACE custom TCP protocol
+The chat itself is **not** available over the public HTTP API. The native client uses the AACE custom TCP protocol
 (`Aace::tcp_client`, `MsgSender`, `SndPkgNode`; observed on `36.134.88.78:13003`), SQLCipher databases under
 `%APPDATA%\suyan\yunpan\data\<userId>\` (`welldone.db`, `contacts.db`, `group.db`, ...), and SDK methods such as
 `getChatList`, `getSingleMsg`, `sendMsg`. Probe requests to `/access/SingleChat/sendMsg` and
 `/webaace/SingleChat/sendMsg` returned `retcode=-90006, errmsg="无效的请求"` with `msgId=0` (no message delivered),
-so the web session is not sufficient for chat. `webaace` calls from the client use `Cookie` and an
-`Authorization` value that appears to be a per-request signature; reusing the web cookies does not satisfy it.
+so the web session is not sufficient for HTTP chat. Use the web IM page via the client debug port (above) for a
+code-based send.
 
 ## Login
 
