@@ -23,9 +23,10 @@ const TO = arg('--to', '文件传输助手');
 const TEXT = arg('--text', '');
 const ALLOW_ANY = has('--allow-any-chat');
 const DRY_RUN = has('--dry-run');
+const LIST = has('--list');
 
-if (!TEXT) {
-  console.error('usage: im-send.mjs --to <chat name> --text <message> [--allow-any-chat] [--dry-run]');
+if (!TEXT && !LIST) {
+  console.error('usage: im-send.mjs (--to <chat name> --text <message> [--allow-any-chat] [--dry-run]) | --list');
   process.exit(2);
 }
 
@@ -99,6 +100,38 @@ async function main() {
     } catch {
       await sleep(700);
     }
+  }
+
+  if (LIST) {
+    const expr = `(() => {
+      const items = [...document.querySelectorAll('[id^="u"],[id^="g"]')].filter(e => /^[ug]\\d+$/.test(e.id));
+      return items.map(e => {
+        const n = e.querySelector('.ellipsis.c-dark');
+        const text = (e.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+        return {
+          id: e.id,
+          name: n ? n.textContent.trim() : null,
+          preview: text.length > 1 ? text[text.length - 2] : null,
+          selected: e.className.split(/\\s+/).some(c => c.startsWith('active')),
+        };
+      }).filter(x => x.name);
+    })()`;
+    let out = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true }, 15000);
+        out = r.result?.value;
+        break;
+      } catch {
+        await sleep(700);
+      }
+    }
+    if (!out) {
+      console.log(JSON.stringify({ ok: false, reason: 'list-timeout' }));
+      process.exit(5);
+    }
+    console.log(JSON.stringify({ ok: true, chats: out }));
+    process.exit(0);
   }
 
   const expression = `

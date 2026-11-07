@@ -18,6 +18,33 @@ Send them as a normal `Cookie` header. `/webadmin/*` additionally accepts `X-Sky
 commands here do not call those endpoints. Responses use JSON; `Content-Type: application/json` is required for
 `/drive/service/*`; an empty body gives `JSON_PARSE_EXCEPTION` even for reads.
 
+## Security policy
+
+`%USERPROFILE%\.dsh\ecloud\policy.json` is the write/read allowlist. Defaults used when it is absent (and written by
+`policy -Init`):
+
+```json
+{
+  "allowedGroups": ["temp-waicai"],
+  "allowedWriteGroups": ["temp-waicai"],
+  "allowPublicGroups": false,
+  "allowPersonalWrites": true,
+  "requireConfirmTarget": true,
+  "allowedChats": ["文件传输助手"],
+  "allowAnyChat": false,
+  "maxUploadMB": 5,
+  "maxMessageChars": 2000,
+  "sendCooldownSeconds": 3
+}
+```
+
+- Group read/write commands check the allowlist and refuse `isPublic=1` groups while `allowPublicGroups=false`.
+- Every write/download/upload needs `-ConfirmTarget` exactly equal to the canonical path
+  (`个人盘\...` or `<group>\...`); `-Yes` is also required.
+- `msg-send` needs `-ConfirmRecipient` equal to `-To`; non-file-assistant chats additionally need
+  `-AllowAnyChat` **and** `allowAnyChat=true` plus the exact chat in `allowedChats`.
+- A malformed policy file fails closed. The agent must not edit the policy without an explicit user instruction.
+
 ## Drive
 
 Base: `https://www.ecpan.cn`.
@@ -41,12 +68,11 @@ Content-Type: application/json
 
 {
   "diskType": 1,
-  "fileType": "1",
   "status": 1,
   "orderField": "create_date",
   "orderBy": "desc",
   "usn": <usn>,
-  "parentId": "<personal-root-appFileId>",
+  "parentId": "<folder appFileId>",
   "pageSize": 100,
   "reqPage": 1,
   "picHeight": 72,
@@ -55,8 +81,9 @@ Content-Type: application/json
 }
 ```
 
-`parentId = -1` lists the personal-space roots; the entry named `个人盘` is the personal disk. Use its
-`appFileId` as the parent for the root contents. `fileType` is `1` for folders and files in the listing.
+Do **not** send `"fileType": "1"` for a normal folder listing: it filters out files and was the cause of a false
+"uploaded file is not visible" check. The personal-root lookup (`parentId=-1`) does use `fileType:"1"` to find the
+`个人盘` folder. Listings paginate on `var.pageCount`; the CLI fetches up to 10 pages (100 items each).
 
 ### Create an empty folder
 
@@ -98,7 +125,7 @@ The search-by-name result identifies the root with `groupId`; the root folder vi
 (groupId `516940`): root listing, sub-folder listing, and `common:createFolder` with
 `{"comeFrom":0,"creatorUsn":<group.createdByUsn>,"diskType":2,"fileName":"...","groupId":"516940","parentId":"..."}`.
 
-### Upload a small file to a group
+### Upload a small file (personal or group)
 
 Use **multipart** against `onestfile.do`; a JSON body returns `JSON_PARSE_EXCEPTION`.
 
@@ -107,9 +134,10 @@ POST /drive/service/common/onestfile.do?func=common:onestUpload
 Content-Type: multipart/form-data
 
 file=<file bytes>
-parentId=<target folder appFileId; groupId for the root>
-diskType=2
-groupId=<groupId>
+appFileId=<target folder appFileId>     # required for personal uploads
+parentId=<target folder appFileId; groupId for the group root>
+diskType=1|2
+groupId=<"" for personal, groupId for group>
 fileName=<name>
 fileSize=<bytes>
 fileMd5=<lower-case hex MD5>
@@ -118,10 +146,15 @@ comeFrom=0
 newFlag=1
 model=0
 usn=<current usn>
-creatorUsn=<group.createdByUsn>
+creatorUsn=<usn for personal, group.createdByUsn for group>
 fileType=2
-filePath=<parent filePath, or "/">
+filePath=<target folder filePath, or "/">
 ```
+
+For a personal upload the response contains the new file object with `appFileId`, `filePath`
+(`个人盘\...`) and `groupId` set to the personal root. Omitting `appFileId` can make the server accept the
+request without creating the file. After the upload the CLI lists the target folder and refuses to report success
+if the new file is not visible.
 
 Returns `{code:"S_OK", var:{appFileId, dfsFileId, fileName, fileSize, fileMd5, version, ...}}`.
 The browser uploader chunks files above 5 MB and calls `common:completeUpload`; this CLI only does the single
@@ -135,15 +168,16 @@ Content-Type: application/json
 
 {
   "comeFrom": 0, "corpId": <corpId>, "creatorUsn": <file.createdByUsn>,
-  "diskType": 2, "downSource": 1,
+  "diskType": 1|2, "downSource": 1,
   "fileIdList": [{"appFileId":"...","fileSize":...,"fileVersion":...,"rootUsn":...,
-                  "fileType":2,"fileName":"...","diskType":2,"groupId":"..."}],
-  "fileName":"...", "groupId":"...", "isIp":0, "isDownload":1
+                  "fileType":2,"fileName":"...","diskType":1|2,"groupId":""|"<groupId>"}],
+  "fileName":"...", "groupId":""|"<groupId>", "isIp":0, "isDownload":1
 }
 ```
 
 Response `var.downloadUrl` is an HTTP URL containing the `sid`; download it promptly and do not log the URL.
-Verified for a group file (64 bytes, MD5 matched) and for an empty group folder (a 160-byte zip).
+The CLI verifies the local size and MD5 when the API returns them. Verified for personal and group files
+(53/64 bytes, MD5 matched) and for an empty group folder (a 160-byte zip).
 
 ### WPS online view/edit link
 
@@ -167,6 +201,9 @@ Content-Type: application/json
 Set `isWrite` to `1` for the edit link. The response uses `code: "0010200001"` and
 `content.url` / `content.token`, not the `S_OK` shape. The URL contains a short-lived token; treat it as a
 credential and give it only to the user who asked for the file.
+
+Personal files use the same endpoint with `downloadUrl` from the personal-disk download and `permission`
+`1111111111` when the listing has no permission value. Verified for both personal and group files.
 
 ### Not implemented
 
@@ -209,11 +246,18 @@ Useful DOM facts:
 | Send trigger | `keydown` Enter on the editor (button `disabled` may stay true because the app model is not updated by `execCommand`) |
 
 `scripts/im-send.mjs` implements this, defaults to 文件传输助手, requires an exact chat name and an explicit
-`--allow-any-chat` for anything else, supports `--dry-run`, and verifies that the draft clears and the text appears
-in the page. It does not send in bulk and does not read history. The debug port is local-only but powerful; close it
-by restarting the client normally after use.
+`--allow-any-chat` for anything else, supports `--dry-run` and `--list` (chat names/IDs for `msg-chats`), and
+verifies that the draft clears and the text appears in the page. It does not send in bulk and does not read
+history. The debug port is local-only but powerful; close it by restarting the client normally after use.
+
+The CLI adds the policy layer on top: a chat must be in `allowedChats` (or `allowAnyChat=true` plus
+`-AllowAnyChat`), `-ConfirmRecipient` must exactly equal `-To`, `-Yes` is required, the message is length/control
+character checked, and a 3-second cooldown file (`%USERPROFILE%\.dsh\ecloud\last-send.json`) blocks rapid repeats.
+No retry is performed after a send.
 
 Verified on 2026-11-07: two test messages were sent to 文件传输助手 with this path, no Windows mouse/keyboard input.
+The hardened guards were tested separately (chat not allowlisted, missing recipient confirmation, cooldown, group
+allowlist, target mismatch); no extra messages were sent for those tests.
 
 ## IM (read-only HTTP)
 
@@ -254,5 +298,7 @@ credential: do not commit, print or paste it into tickets.
 | Client install | `C:\ProgramData\Ecloud\Ecpan\Ecloud Cloud Ecpan Application.exe` |
 | Client version | `5.10.28` (`app.dat`) |
 | Client data | `%APPDATA%\suyan\yunpan` |
+| Policy file | `%USERPROFILE%\.dsh\ecloud\policy.json` |
+| Debug port | `9222` local CEF (`--remote-debugging-port=9222 --remote-allow-origins=*`) |
 | Edge (for login) | `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe` |
 | Node | v26.7.0, global `WebSocket` available |
