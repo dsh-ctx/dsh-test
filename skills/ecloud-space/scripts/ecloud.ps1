@@ -20,16 +20,21 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('login', 'status', 'whoami', 'ls', 'mkdir', 'im-orgs', 'client-info')]
+    [ValidateSet('login', 'status', 'whoami', 'ls', 'mkdir', 'groups', 'group-ls', 'group-mkdir', 'upload', 'download', 'view-url', 'im-orgs', 'client-info')]
     [string]$Command,
 
     [Parameter(Position = 1)]
-    [string]$Path = '个人盘',
+    [string]$Path = '',
 
     [string]$Name,
+    [string]$Group,
+    [string]$File,
+    [string]$Out,
+    [string]$RemoteName,
     [string]$Cookie,
     [string]$BaseUrl = 'https://www.ecpan.cn',
     [switch]$Yes,
+    [switch]$Edit,
     [switch]$Json
 )
 
@@ -174,6 +179,96 @@ function Resolve-Folder([string]$FolderPath) {
     return $current
 }
 
+function Get-Group([string]$GroupName) {
+    if (-not $GroupName) { throw 'This command requires -Group <group name>.' }
+    $body = @{
+        diskType = 2; isGroup = 1; pageSize = 100
+        picHeight = 72; picThumbnail = 1; picWidth = 72
+        reqPage = 1; searchType = 0; isGroupMembers = $false
+        groupName = $GroupName
+    }
+    $r = Invoke-EcloudApi -ApiPath '/drive/service/group/group?func=group:groupList' -Body $body
+    $g = @($r.var.resultList) | Where-Object { $_.groupName -eq $GroupName } | Select-Object -First 1
+    if (-not $g) { throw "Group not found: $GroupName" }
+    # The group-list search result identifies the root by groupId; the root folder
+    # view (parentId=groupId) also carries appFileId. Normalize both shapes.
+    $g | Add-Member -NotePropertyName appFileId -NotePropertyValue ([string]$g.groupId) -Force
+    $g | Add-Member -NotePropertyName fileName -NotePropertyValue $g.groupName -Force
+    $g | Add-Member -NotePropertyName fileType -NotePropertyValue 1 -Force
+    if (-not $g.PSObject.Properties['filePath']) {
+        $g | Add-Member -NotePropertyName filePath -NotePropertyValue "群组空间\$($g.groupName)" -Force
+    }
+    return $g
+}
+
+function Get-GroupDirId($FolderOrGroup) {
+    if ($FolderOrGroup.appFileId) { return [string]$FolderOrGroup.appFileId }
+    return [string]$FolderOrGroup.groupId
+}
+
+function List-GroupChildren($GroupInfo, [string]$ParentId) {
+    $body = @{
+        createdByUsn = $GroupInfo.createdByUsn
+        diskType = 2; isGroup = 1
+        orderBy = 'desc'; orderField = 'modify_date'
+        pageSize = 100
+        parentId = $ParentId
+        picHeight = 72; picThumbnail = 1; picWidth = 72
+        reqPage = 1; isGroupMembers = $false
+    }
+    $r = Invoke-EcloudApi -ApiPath '/drive/service/group/group?func=group:groupList' -Body $body
+    return @($r.var.resultList | Where-Object { $_.fileName -or $_.groupName })
+}
+
+function Resolve-GroupFolder($GroupInfo, [string]$FolderPath) {
+    $clean = ($FolderPath -replace '/', '\').Trim('\')
+    $current = $GroupInfo
+    if (-not $clean) { return $current }
+    foreach ($segment in $clean.Split('\')) {
+        if (-not $segment) { continue }
+        $children = List-GroupChildren $GroupInfo (Get-GroupDirId $current)
+        $next = $children | Where-Object { $_.fileName -eq $segment -and $_.fileType -eq 1 } | Select-Object -First 1
+        if (-not $next) { throw "Group folder not found: $segment (under $($current.fileName))" }
+        $current = $next
+    }
+    return $current
+}
+
+function Resolve-GroupFile($GroupInfo, [string]$FilePath) {
+    $clean = ($FilePath -replace '/', '\').Trim('\')
+    if (-not $clean) { throw 'download requires -Path <folder/file>.' }
+    $parts = @($clean.Split('\') | Where-Object { $_ })
+    if ($parts.Count -lt 1) { throw 'download requires -Path <folder/file>.' }
+    $fileName = $parts[-1]
+    $folderPath = if ($parts.Count -gt 1) { ($parts[0..($parts.Count - 2)] -join '\') } else { '' }
+    $parent = Resolve-GroupFolder $GroupInfo $folderPath
+    $children = List-GroupChildren $GroupInfo (Get-GroupDirId $parent)
+    $file = $children | Where-Object { $_.fileName -eq $fileName -and $_.fileType -ne 1 } | Select-Object -First 1
+    if (-not $file) { throw "Group file not found: $fileName (under $($parent.fileName))" }
+    return [pscustomobject]@{ file = $file; parent = $parent }
+}
+
+function Get-GroupDownloadUrl($GroupInfo, $FileInfo) {
+    $u = Get-UserInfo
+    $body = @{
+        comeFrom = 0; corpId = $u.corpId
+        creatorUsn = $FileInfo.createdByUsn
+        diskType = 2; downSource = 1
+        fileIdList = @(@{
+            appFileId = $FileInfo.appFileId; fileSize = $FileInfo.fileSize
+            fileVersion = $FileInfo.version; rootUsn = $FileInfo.rootUsn
+            fileType = $FileInfo.fileType; fileName = $FileInfo.fileName
+            diskType = 2; groupId = $GroupInfo.groupId
+        })
+        fileName = $FileInfo.fileName; groupId = $GroupInfo.groupId
+        isIp = 0; isDownload = 1
+    }
+    $r = Invoke-EcloudApi -ApiPath '/drive/service/common/file.do?func=common:download' -Body $body
+    $url = $r.var.downloadUrl
+    if (-not $url) { throw 'Download URL missing from response.' }
+    return $url
+}
+
 function Format-Size([long]$Bytes) {
     if ($Bytes -ge 1TB) { return ('{0:N1} TB' -f ($Bytes / 1TB)) }
     if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
@@ -265,7 +360,8 @@ try {
             Write-Output "Saved at:  $($s.savedAt)"
         }
         'ls' {
-            $folder = Resolve-Folder $Path
+            $p = if ($Path) { $Path } else { '个人盘' }
+            $folder = Resolve-Folder $p
             $children = List-Children $folder.appFileId
             if ($Json) {
                 [pscustomobject]@{
@@ -296,7 +392,8 @@ try {
             Assert-Confirmed "create a folder"
             if (-not $Name) { throw 'mkdir requires -Name <folder>.' }
             if ($Name -match '[\\/:*?"<>|]') { throw 'Folder name contains invalid characters.' }
-            $parent = Resolve-Folder $Path
+            $p = if ($Path) { $Path } else { '个人盘' }
+            $parent = Resolve-Folder $p
             $body = @{
                 comeFrom = 0; creatorUsn = 0; diskType = 1
                 fileName = $Name; groupId = ''; parentId = $parent.appFileId
@@ -307,6 +404,188 @@ try {
                     ConvertTo-Json -Depth 4
             } else {
                 Write-Output "Created folder '$Name' under '$($parent.fileName)'. Id: $($r.var)"
+            }
+        }
+        'groups' {
+            $body = @{
+                diskType = 2; isGroup = 1; pageSize = 100
+                picHeight = 72; picThumbnail = 1; picWidth = 72
+                reqPage = 1; searchType = 0; isGroupMembers = $false
+            }
+            $r = Invoke-EcloudApi -ApiPath '/drive/service/group/group?func=group:groupList' -Body $body
+            $groups = @($r.var.resultList)
+            if ($Json) {
+                [pscustomobject]@{
+                    groups = @($groups | ForEach-Object {
+                        [pscustomobject]@{
+                            groupId = $_.groupId; name = $_.groupName; members = $_.memberCount
+                            files = $_.fileCount; createdByUsn = $_.createdByUsn; createdBy = $_.createdByName
+                        }
+                    })
+                } | ConvertTo-Json -Depth 5
+                break
+            }
+            $rows = @($groups | ForEach-Object {
+                [pscustomobject]@{
+                    GroupId = $_.groupId; Name = $_.groupName; Members = $_.memberCount
+                    Files = $_.fileCount; CreatedBy = $_.createdByName
+                }
+            })
+            $rows | Format-Table -AutoSize | Out-String -Width 240 | Write-Output
+        }
+        'group-ls' {
+            $g = Get-Group $Group
+            $folder = Resolve-GroupFolder $g $Path
+            $children = List-GroupChildren $g (Get-GroupDirId $folder)
+            if ($Json) {
+                [pscustomobject]@{
+                    group = $g.groupName; groupId = $g.groupId
+                    folder = $folder.fileName; folderId = $folder.appFileId
+                    items = @($children | ForEach-Object {
+                        [pscustomobject]@{
+                            name = $_.fileName; type = if ($_.fileType -eq 1) { 'folder' } else { 'file' }
+                            size = [long]$_.fileSize; modified = $_.modifyDate
+                            id = $_.appFileId; parentId = $_.parentId
+                        }
+                    })
+                } | ConvertTo-Json -Depth 6
+                break
+            }
+            $rows = @($children | ForEach-Object {
+                [pscustomobject]@{
+                    Type = if ($_.fileType -eq 1) { 'DIR' } else { 'FILE' }
+                    Name = $_.fileName
+                    Size = if ($_.fileType -eq 1) { '' } else { Format-Size ([long]$_.fileSize) }
+                    Modified = $_.modifyDate
+                    Id = $_.appFileId
+                }
+            })
+            $folderLabel = if ($folder.fileName) { $folder.fileName } else { $folder.groupName }
+            Write-Output "Group: $($g.groupName) / $folderLabel  ($($rows.Count) item(s))"
+            Show-Table $rows @('Type', 'Name', 'Size', 'Modified', 'Id')
+        }
+        'group-mkdir' {
+            Assert-Confirmed "create a group folder"
+            if (-not $Name) { throw 'group-mkdir requires -Name <folder>.' }
+            if ($Name -match '[\\/:*?"<>|]') { throw 'Folder name contains invalid characters.' }
+            $g = Get-Group $Group
+            $parent = Resolve-GroupFolder $g $Path
+            $body = @{
+                comeFrom = 0; creatorUsn = $g.createdByUsn; diskType = 2
+                fileName = $Name; groupId = $g.groupId; parentId = (Get-GroupDirId $parent)
+            }
+            $r = Invoke-EcloudApi -ApiPath '/drive/service/common/file.do?func=common:createFolder' -Body $body
+            if ($Json) {
+                [pscustomobject]@{
+                    group = $g.groupName; created = $Name; parent = $parent.fileName
+                    parentId = $parent.appFileId; id = $r.var
+                } | ConvertTo-Json -Depth 4
+            } else {
+                Write-Output "Created group folder '$Name' under '$($parent.fileName)'. Id: $($r.var)"
+            }
+        }
+        'upload' {
+            Assert-Confirmed "upload a file"
+            if (-not $File) { throw 'upload requires -File <local path>.' }
+            if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "Local file not found: $File" }
+            $item = Get-Item -LiteralPath $File
+            if ($item.Length -gt 5MB) { throw 'Files over 5 MB need the chunked web uploader; this CLI handles small files only.' }
+            $g = Get-Group $Group
+            $parent = Resolve-GroupFolder $g $Path
+            $u = Get-UserInfo
+            $s = Get-Session
+            $md5 = (Get-FileHash -LiteralPath $item.FullName -Algorithm MD5).Hash.ToLowerInvariant()
+            $remoteName = if ($RemoteName) { $RemoteName } else { $item.Name }
+            $form = @{
+                file = $item
+                parentId = (Get-GroupDirId $parent)
+                diskType = '2'
+                groupId = [string]$g.groupId
+                fileName = $remoteName
+                fileSize = [string]$item.Length
+                fileMd5 = $md5
+                uploadType = '1'
+                comeFrom = '0'
+                newFlag = '1'
+                model = '0'
+                usn = [string]$u.usn
+                creatorUsn = [string]$g.createdByUsn
+                fileType = '2'
+                filePath = if ($parent.filePath) { $parent.filePath } else { '/' }
+            }
+            $headers = @{ Cookie = $s.cookie; Accept = 'application/json, text/plain, */*' }
+            $r = Invoke-RestMethod -Uri "$($script:BaseUrl)/drive/service/common/onestfile.do?func=common:onestUpload" `
+                -Method Post -Headers $headers -Form $form -TimeoutSec 180
+            if ($r.code -ne 'S_OK') { throw "Upload failed: $($r.code) $($r.summary)" }
+            $created = $r.var
+            if ($Json) {
+                [pscustomobject]@{
+                    uploaded = $true; group = $g.groupName; parent = $parent.fileName
+                    name = $created.fileName; id = $created.appFileId; size = $created.uploadSize
+                    md5 = $created.fileMd5
+                } | ConvertTo-Json -Depth 4
+            } else {
+                Write-Output "Uploaded '$($created.fileName)' to '$($g.groupName) / $($parent.fileName)'. Id: $($created.appFileId)"
+            }
+        }
+        'download' {
+            Assert-Confirmed "download a file"
+            if (-not $Out) { throw 'download requires -Out <local path>.' }
+            $g = Get-Group $Group
+            $res = Resolve-GroupFile $g $Path
+            $f = $res.file
+            $url = Get-GroupDownloadUrl $g $f
+            $fullOut = [IO.Path]::GetFullPath($Out)
+            $dir = Split-Path -Parent $fullOut
+            if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+            Invoke-WebRequest -Uri $url -OutFile $fullOut -TimeoutSec 180
+            $got = Get-Item -LiteralPath $fullOut
+            if ($Json) {
+                [pscustomobject]@{
+                    downloaded = $true; group = $g.groupName; name = $f.fileName
+                    out = $fullOut; bytes = $got.Length
+                } | ConvertTo-Json -Depth 4
+            } else {
+                Write-Output "Downloaded '$($f.fileName)' from '$($g.groupName)' to $fullOut ($($got.Length) bytes)."
+            }
+        }
+        'view-url' {
+            $g = Get-Group $Group
+            $res = Resolve-GroupFile $g $Path
+            $f = $res.file
+            $u = Get-UserInfo
+            $s = Get-Session
+            $dl = Get-GroupDownloadUrl $g $f
+            $ext = [IO.Path]::GetExtension($f.fileName).TrimStart('.').ToLowerInvariant()
+            $body = @{
+                downloadUrl = $dl
+                fileId = $f.appFileId
+                fileName = $f.fileName
+                fileType = $ext
+                usn = $u.usn
+                permission = $f.permission
+                isWrite = if ($Edit) { 1 } else { 0 }
+                creater = $u.userName
+                localType = 0
+            } | ConvertTo-Json -Depth 4 -Compress
+            $headers = @{
+                Cookie = $s.cookie
+                'Content-Type' = 'application/json'
+                Accept = 'application/json, text/plain, */*'
+            }
+            $r = Invoke-RestMethod -Uri "$($script:BaseUrl)/api/v1/edit/cloudp/wps/url/getViewUrl" `
+                -Method Post -Headers $headers -Body $body -TimeoutSec 30
+            $url = $r.content.url
+            if (-not $url) {
+                throw "WPS URL not returned: code=$($r.code) message=$($r.message) hint=$($r.hint)"
+            }
+            if ($Json) {
+                [pscustomobject]@{
+                    group = $g.groupName; name = $f.fileName; edit = [bool]$Edit
+                    url = $url; token = $r.content.token
+                } | ConvertTo-Json -Depth 4
+            } else {
+                Write-Output "WPS $([bool]$Edit ? 'edit' : 'view') URL for '$($f.fileName)': $url"
             }
         }
         'im-orgs' {

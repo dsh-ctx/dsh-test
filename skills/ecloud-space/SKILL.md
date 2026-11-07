@@ -1,6 +1,6 @@
 ---
 name: ecloud-space
-description: Access 中国移动「移动云空间」(Ecpan, www.ecpan.cn) on Windows without driving the Windows UI. Use for listing/creating folders in the personal cloud disk, reading account and quota information, and querying IM organizations. File transfer and chat stay in the desktop client.
+description: Access 中国移动「移动云空间」(Ecpan, www.ecpan.cn) on Windows without driving the Windows UI. Use for personal and group cloud disks: account/quota, list, create folders, upload/download small files, WPS view/edit links, and IM organization lookup. Chat itself stays in the desktop client.
 ---
 
 # 移动云空间 (Ecpan) access
@@ -48,44 +48,56 @@ All commands print a short table; add `-Json` for machine-readable output.
 # Account, usn, organization and quota.
 pwsh -File scripts\ecloud.ps1 whoami -Json
 
-# List the personal disk root ("个人盘").
+# Personal disk: list the root ("个人盘") or a sub-folder.
 pwsh -File scripts\ecloud.ps1 ls
-
-# List a sub-folder by path or just by name.
 pwsh -File scripts\ecloud.ps1 ls -Path "个人盘\2026"
-
-# Create an empty folder. Write operations need explicit confirmation from the user.
 pwsh -File scripts\ecloud.ps1 mkdir -Path "个人盘" -Name "dsh-ecloud-skill-test" -Yes
 
-# Return the IM organizations visible to the current account (read-only).
-pwsh -File scripts\ecloud.ps1 im-orgs -Json
+# Group spaces (diskType 2).
+pwsh -File scripts\ecloud.ps1 groups
+pwsh -File scripts\ecloud.ps1 group-ls -Group "temp-waicai"
+pwsh -File scripts\ecloud.ps1 group-ls -Group "temp-waicai" -Path "some-folder"
+pwsh -File scripts\ecloud.ps1 group-mkdir -Group "temp-waicai" -Path "some-folder" -Name "new-folder" -Yes
 
-# Describe the local desktop client and its data directories (read-only).
+# Small-file transfer in a group (HTTP multipart, <= 5 MB).
+pwsh -File scripts\ecloud.ps1 upload -Group "temp-waicai" -Path "some-folder" -File "C:\tmp\a.txt" -Yes
+pwsh -File scripts\ecloud.ps1 download -Group "temp-waicai" -Path "some-folder\a.txt" -Out "C:\tmp\a.txt" -Yes
+
+# WPS online view/edit link (the URL contains a short-lived token; do not log or share it).
+pwsh -File scripts\ecloud.ps1 view-url -Group "temp-waicai" -Path "some-folder\a.txt"
+pwsh -File scripts\ecloud.ps1 view-url -Group "temp-waicai" -Path "some-folder\a.txt" -Edit
+
+# Read-only IM organization lookup and local client description.
+pwsh -File scripts\ecloud.ps1 im-orgs -Json
 pwsh -File scripts\ecloud.ps1 client-info
 ```
 
 ## Safety rules
 
-1. Default to read-only operations (`status`, `whoami`, `ls`, `im-orgs`, `client-info`).
-2. Run `mkdir` only after the user explicitly asks for a new folder; use a clear test name.
-3. Do not upload, download, rename, move or delete files through this skill. Those endpoints exist in the web app but
-   are not validated here, and the user has asked for no uncontrolled file transfer.
-4. Never use the session for another person's disk or another organization. The session belongs to the account that
+1. Default to read-only operations (`status`, `whoami`, `ls`, `groups`, `group-ls`, `im-orgs`, `client-info`).
+2. `mkdir`, `group-mkdir`, `upload` and `download` run only when the user explicitly asks for that operation, and
+   require `-Yes`. Use a clear test name; do not touch groups or folders the user did not name.
+3. `upload` is limited to files up to 5 MB because the chunked browser uploader is not reimplemented. Do not upload
+   into a production group without an explicit instruction.
+4. `view-url` returns a WPS URL containing a short-lived token. Give it to the user; do not paste it into tickets or
+   logs. Opening it is a normal browser action, not Windows UI automation.
+5. Never use the session for another person's disk or another organization. The session belongs to the account that
    logged in.
-5. If a response is `SESSION_TIMEOUT`, ask the user to log in again; do not try to guess credentials.
+6. If a response is `SESSION_TIMEOUT`, ask the user to log in again; do not try to guess credentials.
 
 ## Messaging (desktop client only)
 
 The web app exposes read-only IM queries (`/access/IMLogin/getValidOrgIds`,
-`/access/Contacts/getOrgsName`) but **no public send/list-history API**. Sending a message and reading chat history
-require the Windows client, whose IM runs over a private TCP connection and stores chats in SQLCipher databases under
-`%APPDATA%\suyan\yunpan\data\<im-user-id>\`. This skill deliberately does not automate that client UI.
+`/access/Contacts/getOrgsName`) but **no public send/list-history API**. The native client's chat uses the AACE TCP
+protocol (`Aace::tcp_client`, `MsgSender`) and SQLCipher databases under
+`%APPDATA%\suyan\yunpan\data\<im-user-id>\`. The web-session POST to `/access/SingleChat/sendMsg` returns
+`retcode=-90006` with `msgId=0`, so it does not deliver a message.
 
-What the agent can do for messages:
+This skill deliberately does not automate the Windows client UI. What the agent can do for messages:
 
 - Report that messaging is client-only, and show the client path and account from `client-info`.
 - Ask the user to use the client's **消息** view (the client keeps its login state).
-- Do not synthesize clicks or keystrokes, do not scrape memory, and do not attempt to decrypt `welldone.db`.
+- Do not synthesize clicks or keystrokes, do not scrape process memory, and do not attempt to decrypt `welldone.db`.
 
 If the user explicitly accepts Windows UI automation for messaging, that is a separate, opt-in helper and must be
 reviewed as such; it is not part of this skill.
@@ -101,7 +113,9 @@ reviewed as such; it is not part of this skill.
 | Client IM data | `%APPDATA%\suyan\yunpan\data\<im-user-id>\` (SQLCipher `welldone.db`, `contacts.db`, ...) |
 | Enterprise | read `corpId` from `whoami`; do not hard-code it |
 | Personal disk | diskType `1`; root folder name `个人盘`; root lookup `parentId=-1` |
-| Test artifacts | `个人盘\dsh-ecloud-skill-test-*` (two empty folders created during verification) |
+| Group space | diskType `2`; list by `group:groupList`; root `parentId = groupId` |
+| Test group | `temp-waicai` (groupId `516940`, created for verification; one member) |
+| Test artifacts | `个人盘\dsh-ecloud-skill-test-*`; `temp-waicai\dsh-ecloud-skill-test` with two small `.txt` files and one empty sub-folder |
 
 The account-specific values above are examples from the verification machine; read the current values from
 `whoami` instead of hard-coding them.

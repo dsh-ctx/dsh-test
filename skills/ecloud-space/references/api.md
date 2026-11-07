@@ -76,20 +76,107 @@ Content-Type: application/json
 
 Returns `{ code: "S_OK", errorCode: "<new name>", var: "<new appFileId>" }`.
 
-### Endpoints known but not included in the CLI
+### Group spaces
 
-These exist in the web bundle and are useful for a future, explicitly reviewed file-transfer command:
+```
+POST /drive/service/group/group?func=group:groupList
+Content-Type: application/json
 
-| Function | Endpoint |
-|---|---|
-| Upload | `POST /drive/service/common/file.do?func=common:upload` (multipart) |
-| Download | `POST /drive/service/common/file.do?func=common:download` |
-| Delete | `POST /drive/service/common/file.do?func=common:deleteFile` |
-| Rename | `POST /drive/service/common/file.do?func=common:rename` |
-| Move/copy | `POST /drive/service/common/file.do?func=common:mvOrCp` |
-| Search | `POST /drive/service/disk/search.do?func=disk:searchIndex` |
+# find a group by name
+{"diskType":2,"isGroup":1,"pageSize":100,"picHeight":72,"picThumbnail":1,"picWidth":72,
+ "reqPage":1,"searchType":0,"isGroupMembers":false,"groupName":"<name>"}
 
-They were deliberately not exercised because the ticket forbids uncontrolled upload/download/delete tests.
+# list the group root or a sub-folder
+{"createdByUsn":<group.createdByUsn>,"diskType":2,"isGroup":1,
+ "orderBy":"desc","orderField":"modify_date","pageSize":100,
+ "parentId":"<groupId or folder appFileId>","picHeight":72,"picThumbnail":1,"picWidth":72,
+ "reqPage":1,"isGroupMembers":false}
+```
+
+The search-by-name result identifies the root with `groupId`; the root folder view uses
+`parentId = groupId`. Use the group's `createdByUsn` for listings. Verified in `temp-waicai`
+(groupId `516940`): root listing, sub-folder listing, and `common:createFolder` with
+`{"comeFrom":0,"creatorUsn":<group.createdByUsn>,"diskType":2,"fileName":"...","groupId":"516940","parentId":"..."}`.
+
+### Upload a small file to a group
+
+Use **multipart** against `onestfile.do`; a JSON body returns `JSON_PARSE_EXCEPTION`.
+
+```
+POST /drive/service/common/onestfile.do?func=common:onestUpload
+Content-Type: multipart/form-data
+
+file=<file bytes>
+parentId=<target folder appFileId; groupId for the root>
+diskType=2
+groupId=<groupId>
+fileName=<name>
+fileSize=<bytes>
+fileMd5=<lower-case hex MD5>
+uploadType=1
+comeFrom=0
+newFlag=1
+model=0
+usn=<current usn>
+creatorUsn=<group.createdByUsn>
+fileType=2
+filePath=<parent filePath, or "/">
+```
+
+Returns `{code:"S_OK", var:{appFileId, dfsFileId, fileName, fileSize, fileMd5, version, ...}}`.
+The browser uploader chunks files above 5 MB and calls `common:completeUpload`; this CLI only does the single
+multipart request and therefore caps at 5 MB.
+
+### Download
+
+```
+POST /drive/service/common/file.do?func=common:download
+Content-Type: application/json
+
+{
+  "comeFrom": 0, "corpId": <corpId>, "creatorUsn": <file.createdByUsn>,
+  "diskType": 2, "downSource": 1,
+  "fileIdList": [{"appFileId":"...","fileSize":...,"fileVersion":...,"rootUsn":...,
+                  "fileType":2,"fileName":"...","diskType":2,"groupId":"..."}],
+  "fileName":"...", "groupId":"...", "isIp":0, "isDownload":1
+}
+```
+
+Response `var.downloadUrl` is an HTTP URL containing the `sid`; download it promptly and do not log the URL.
+Verified for a group file (64 bytes, MD5 matched) and for an empty group folder (a 160-byte zip).
+
+### WPS online view/edit link
+
+```
+POST /api/v1/edit/cloudp/wps/url/getViewUrl
+Content-Type: application/json
+
+{
+  "downloadUrl": "<var.downloadUrl from common:download>",
+  "fileId": "<file appFileId>",
+  "fileName": "a.txt",
+  "fileType": "txt",
+  "usn": <usn>,
+  "permission": "1111111111",
+  "isWrite": 0,
+  "creater": "<userName>",
+  "localType": 0
+}
+```
+
+Set `isWrite` to `1` for the edit link. The response uses `code: "0010200001"` and
+`content.url` / `content.token`, not the `S_OK` shape. The URL contains a short-lived token; treat it as a
+credential and give it only to the user who asked for the file.
+
+### Not implemented
+
+| Function | Endpoint | Reason |
+|---|---|---|
+| Delete | `common:deleteFile` / `common:newDeleteFile` | Destructive; not requested in the test group |
+| Rename | `common:rename` | Not needed for the verification |
+| Move/copy | `common:mvOrCp` / `common:newMvOrCp` | Not needed for the verification |
+| Search | `disk:searchIndex` | Not needed for the verification |
+| Chunked upload (`>5 MB`) | `common:upload` + `common:completeUpload` | Requires the browser worker's chunk protocol |
 
 ## IM (read-only)
 
@@ -107,12 +194,13 @@ Successful responses are `{"retcode":0,"errmsg":"处理成功","data":...}`. `re
 missing or expired; `retcode=100` with empty `validOrgIds` means the account has no other IM organization.
 
 The chat itself is **not** available here. The native client uses
-`C:\ProgramData\Ecloud\Ecpan\Ecloud Cloud Ecpan Application.exe` with a private TCP connection (observed on
-`36.134.88.78:13003`), SQLCipher databases under `%APPDATA%\suyan\yunpan\data\<userId>\`
-(`welldone.db`, `contacts.db`, `group.db`, ...), and SDK methods such as `getChatList`, `getSingleMsg`,
-`sendMsg`. Probe requests to `/access/SingleChat/sendMsg` and `/webaace/SingleChat/sendMsg` returned
-`retcode=-90006, errmsg="无效的请求"` with `msgId=0` (no message delivered), so the web session is not sufficient
-for chat.
+`C:\ProgramData\Ecloud\Ecpan\Ecloud Cloud Ecpan Application.exe` with the AACE custom TCP protocol
+(`Aace::tcp_client`, `MsgSender`, `SndPkgNode`; observed on `36.134.88.78:13003`), SQLCipher databases under
+`%APPDATA%\suyan\yunpan\data\<userId>\` (`welldone.db`, `contacts.db`, `group.db`, ...), and SDK methods such as
+`getChatList`, `getSingleMsg`, `sendMsg`. Probe requests to `/access/SingleChat/sendMsg` and
+`/webaace/SingleChat/sendMsg` returned `retcode=-90006, errmsg="无效的请求"` with `msgId=0` (no message delivered),
+so the web session is not sufficient for chat. `webaace` calls from the client use `Cookie` and an
+`Authorization` value that appears to be a per-request signature; reusing the web cookies does not satisfy it.
 
 ## Login
 
