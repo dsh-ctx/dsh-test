@@ -1,0 +1,3 @@
+# Do not commit a saved browser session.
+session.json
+*.session.json
